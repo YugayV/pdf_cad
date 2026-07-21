@@ -200,7 +200,7 @@ with tab1:
 
 with tab2:
     st.markdown("#### Подсчёт объектов на чертеже и расчёт сметы")
-    st.caption("Требует ключ OPENAI_API_KEY для визуального анализа (GPT-4o Vision).")
+    st.caption("Требует ключ ANTHROPIC_API_KEY для визуального анализа (Claude Vision).")
 
     count_col, calc_col = st.columns(2)
     with count_col:
@@ -365,7 +365,7 @@ with tab6:
     st.markdown("#### CAD-чат: правки и дополнения к чертежу")
     st.caption(
         "Опишите, что добавить или изменить в текущем CAD-проекте — например «добавь стену от (0,0) до "
-        "(5000,0) высотой 2700 мм» или «покажи, что сейчас есть в проекте». Требует ключ OPENAI_API_KEY. "
+        "(5000,0) высотой 2700 мм» или «покажи, что сейчас есть в проекте». Требует ключ ANTHROPIC_API_KEY. "
         "Начните с вкладки «Экспорт AutoCAD», чтобы загрузить чертёж из PDF как основу проекта, либо стройте "
         "его с нуля прямо здесь."
     )
@@ -387,7 +387,7 @@ with tab6:
                     result = st.session_state.chat_agent.invoke({"input": chat_prompt})
                     answer = result.get("output", str(result))
                 except Exception as e:
-                    answer = f"Ошибка чат-агента (проверьте OPENAI_API_KEY): {e}"
+                    answer = f"Ошибка чат-агента (проверьте ANTHROPIC_API_KEY): {e}"
             st.markdown(answer)
         st.session_state.chat_log.append(("assistant", answer))
 
