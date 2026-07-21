@@ -1,44 +1,52 @@
+from langchain.agents import AgentType, initialize_agent
+from langchain.memory import ConversationBufferMemory
+from langchain.tools import StructuredTool
 from langchain_openai import ChatOpenAI
-from langchain.agents import initialize_agent, AgentType
-from langchain_core.messages import HumanMessage
-from tools import extract_text_from_pdf, analyze_pdf_visuals, search_excel_price, generate_dxf_file
-import streamlit as st
-import base64
 
-def process_vision_query(prompt: str) -> str:
-    """Прямой вызов Vision модели для анализа картинки чертежа."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    img_bytes = st.session_state.get("pdf_image_bytes")
-    
-    if not img_bytes:
-        return "Сначала вызови инструмент analyze_pdf_visuals."
-    
-    base64_image = base64.b64encode(img_bytes).decode('utf-8')
-    
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": f"Ты инженер-чертежник. Проанализируй этот чертеж мебели/помещения. Задача: {prompt}. Опиши объекты, их размеры и количество."},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-        ]
-    )
-    response = llm.invoke([message])
-    return response.content
+from tools import (
+    add_room_label,
+    add_wall,
+    analyze_pdf_visuals_structured,
+    calculate_estimate,
+    extract_room_schedule,
+    extract_text_from_pdf,
+    generate_dxf_file,
+    list_dxf_entities,
+    remove_last_entity,
+    reset_cad_project,
+    search_excel_price,
+    summarize_smeta_costs,
+)
+
+TOOL_FUNCTIONS = [
+    extract_text_from_pdf,
+    analyze_pdf_visuals_structured,
+    extract_room_schedule,
+    search_excel_price,
+    calculate_estimate,
+    summarize_smeta_costs,
+    generate_dxf_file,
+    add_wall,
+    add_room_label,
+    remove_last_entity,
+    list_dxf_entities,
+    reset_cad_project,
+]
+
 
 def get_agent():
+    """Создает нового чат-агента с памятью для диалоговой работы над CAD-проектом:
+    подсчет объектов/площадей, расчет сметы, генерация и правка DXF-чертежа через команды в чате."""
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    
-    tools = [
-        extract_text_from_pdf,
-        analyze_pdf_visuals,
-        search_excel_price,
-        generate_dxf_file
-    ]
-    
+    tools = [StructuredTool.from_function(func=fn) for fn in TOOL_FUNCTIONS]
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
     agent = initialize_agent(
         tools,
         llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+        memory=memory,
         verbose=True,
-        handle_parsing_errors=True # Важно, чтобы агент не падал при ошибках формата
+        handle_parsing_errors=True,  # Важно, чтобы агент не падал при ошибках формата
     )
     return agent
