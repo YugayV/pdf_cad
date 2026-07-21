@@ -7,6 +7,7 @@ from tools import (
     generate_dxf_file,
     render_pdf_preview,
     search_excel_price,
+    summarize_smeta_costs,
 )
 
 # --- НАСТРОЙКА СТИЛЕЙ (МИНИМАЛИЗМ) ---
@@ -175,9 +176,17 @@ with tab2:
                     st.session_state.agent_response = analyze_pdf_visuals_structured(vision_query.strip())
 
     with calc_col:
-        if st.button("💰 Рассчитать смету", use_container_width=True):
+        if st.button("💰 Рассчитать смету (по объектам)", use_container_width=True):
             with st.spinner("Считаю смету..."):
                 st.session_state.agent_response = calculate_estimate()
+
+    st.caption(
+        "Если смета — это калькулятор материалов по комнатам (блоки «ИТОГО» на листе, "
+        "а не список «объект → цена»), используйте расчёт себестоимости ниже."
+    )
+    if st.button("🧾 Посчитать себестоимость по текущему листу сметы"):
+        with st.spinner("Суммирую блоки ИТОГО..."):
+            st.session_state.agent_response = summarize_smeta_costs()
 
     if st.session_state.detected_objects:
         st.markdown("##### Распознанные объекты")

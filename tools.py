@@ -119,6 +119,36 @@ def search_excel_price(material_name: str) -> str:
     return "; ".join(response)
 
 
+def summarize_smeta_costs() -> str:
+    """Считает себестоимость по загруженному листу сметы (формат калькулятора материалов: несколько блоков
+    "ИТОГО" по разделам — материалы, фурнитура, обивка и т.д.). Суммирует все блоки "ИТОГО" в листе.
+    Используй для смет-калькуляторов по материалам, где нет единого списка 'объект-цена'."""
+    df = st.session_state.get("excel_df")
+    if df is None:
+        return "Excel-смета не загружена."
+
+    itogo_rows = []
+    subtotal = 0.0
+    for _, row in df.iterrows():
+        label = str(row[0]).strip() if row[0] is not None else ""
+        if label == "ИТОГО" and len(row) > 4 and pd.notna(row[4]):
+            value = pd.to_numeric(row[4], errors="coerce")
+            if pd.notna(value):
+                itogo_rows.append(value)
+                subtotal += value
+
+    if not itogo_rows:
+        return "Блоки 'ИТОГО' не найдены в этом листе сметы. Возможно, это не калькулятор материалов."
+
+    st.session_state["smeta_subtotal"] = subtotal
+    return (
+        f"Найдено блоков 'ИТОГО': {len(itogo_rows)}. "
+        f"Себестоимость по материалам и фурнитуре: {subtotal:,.2f}. "
+        "Это себестоимость до транспорта/упаковки и торговой наценки — итоговая цена клиенту "
+        "определяется дополнительно (см. блок 'СТОИМОСТЬ' в файле)."
+    )
+
+
 def calculate_estimate() -> str:
     """Сопоставляет объекты, распознанные на чертеже (analyze_pdf_visuals_structured), со сметой в Excel
     и считает итоговую стоимость по каждой позиции и по проекту в целом. Используй после подсчета объектов."""

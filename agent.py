@@ -6,6 +6,7 @@ from tools import (
     extract_text_from_pdf,
     generate_dxf_file,
     search_excel_price,
+    summarize_smeta_costs,
 )
 
 
@@ -17,6 +18,7 @@ def get_agent():
         analyze_pdf_visuals_structured,
         search_excel_price,
         calculate_estimate,
+        summarize_smeta_costs,
         generate_dxf_file,
     ]
 
