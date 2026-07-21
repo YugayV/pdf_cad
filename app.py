@@ -311,7 +311,7 @@ with tab5:
             else:
                 render_pdf_preview(page_number=st.session_state.get("page_number", 1))
         if st.session_state.pdf_preview_bytes:
-            st.image(st.session_state.pdf_preview_bytes, use_container_width=True)
+            st.image(st.session_state.pdf_preview_bytes, use_column_width=True)
         else:
             st.info("Нажмите «Обновить предпросмотр», чтобы отрендерить первую страницу PDF.")
 
