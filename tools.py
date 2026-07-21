@@ -1,5 +1,7 @@
 import base64
 import io
+import json
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -556,3 +558,152 @@ def reset_cad_project() -> str:
     st.session_state["dxf_doc"] = doc
     _export_dxf_doc(doc)
     return "Новый пустой CAD-проект создан."
+
+
+def extract_wall_segments(scale: float = 1.0, page_number: int = 1) -> List[Tuple[float, float, float, float]]:
+    """Извлекает отрезки стен (линии и стороны прямоугольников) с ОДНОЙ страницы PDF в реальных координатах
+    (мм), для 3D-визуализации плана в браузере. Использует ту же логику переноса координат, что и DXF-экспорт."""
+    pdf_bytes = st.session_state.get("pdf_bytes")
+    if not pdf_bytes:
+        return []
+
+    segments: List[Tuple[float, float, float, float]] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if not (1 <= page_number <= len(pdf.pages)):
+            return []
+        page = pdf.pages[page_number - 1]
+        h = page.height
+
+        def to_xy(x, y):
+            return (round(x * scale, 2), round((h - y) * scale, 2))
+
+        for line in page.lines:
+            if len(segments) >= MAX_DXF_ENTITIES:
+                break
+            x0, y0 = to_xy(line["x0"], line["y0"])
+            x1, y1 = to_xy(line["x1"], line["y1"])
+            segments.append((x0, y0, x1, y1))
+
+        for rect in page.rects:
+            if len(segments) >= MAX_DXF_ENTITIES:
+                break
+            p0 = to_xy(rect["x0"], rect["top"])
+            p1 = to_xy(rect["x1"], rect["top"])
+            p2 = to_xy(rect["x1"], rect["bottom"])
+            p3 = to_xy(rect["x0"], rect["bottom"])
+            segments.extend([(*p0, *p1), (*p1, *p2), (*p2, *p3), (*p3, *p0)])
+
+    return segments
+
+
+_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "vendor")
+
+
+def _read_vendor_js(filename: str) -> str:
+    path = os.path.join(_VENDOR_DIR, filename)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def generate_3d_preview_html(
+    wall_height_mm: float = 2700, wall_thickness_mm: float = 150, scale: float = 1.0, page_number: int = 1,
+) -> str:
+    """Строит самодостаточную 3D-сцену (Three.js) из линий/прямоугольников одной страницы чертежа - стены
+    выдавливаются на заданную высоту, с камерой, светом и автоповоротом. Возвращает готовый HTML для вставки
+    через streamlit.components.v1.html. Three.js встроен в HTML напрямую (без CDN), поэтому работает при
+    любом хостинге. Используй для наглядного 3D-просмотра плана в интерфейсе."""
+    segments = extract_wall_segments(scale, page_number)
+    if not segments:
+        return ""
+
+    three_js = _read_vendor_js("three.min.js")
+    orbit_controls_js = _read_vendor_js("OrbitControls.js")
+    segments_json = json.dumps(segments)
+
+    return f"""
+<div id="viewer3d" style="width:100%; height:600px; background:linear-gradient(#dfe9f3,#f7fafc);
+     border-radius:12px; overflow:hidden;"></div>
+<script>{three_js}</script>
+<script>{orbit_controls_js}</script>
+<script>
+(function () {{
+    const segments = {segments_json};
+    const wallHeight = {wall_height_mm};
+    const wallThickness = {wall_thickness_mm};
+    const container = document.getElementById('viewer3d');
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    segments.forEach(function (s) {{
+        minX = Math.min(minX, s[0], s[2]); maxX = Math.max(maxX, s[0], s[2]);
+        minY = Math.min(minY, s[1], s[3]); maxY = Math.max(maxY, s[1], s[3]);
+    }});
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    const size = Math.max(maxX - minX, maxY - minY, 1000);
+
+    // Высота стен и габариты плана бывают в разных, несовместимых единицах (например план еще не
+    // приведен к реальному масштабу) - camera подстраивается под БОЛЬШЕЕ из двух измерений, чтобы сцена
+    // всегда была видна целиком, а не "внутри" стены.
+    const maxDim = Math.max(size, wallHeight * 2.5);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / 600, maxDim / 1000, maxDim * 10);
+    camera.position.set(cx + maxDim * 0.9, maxDim * 0.8, cy + maxDim * 0.9);
+
+    const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+    renderer.setSize(container.clientWidth, 600);
+    renderer.shadowMap.enabled = true;
+    container.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(cx, wallHeight / 3, cy);
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 1.2;
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.85);
+    sun.position.set(cx + maxDim, maxDim * 1.2, cy + maxDim);
+    sun.castShadow = true;
+    scene.add(sun);
+
+    const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(size * 1.6, size * 1.6),
+        new THREE.MeshStandardMaterial({{ color: 0xf2ede4 }})
+    );
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(cx, 0, cy);
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const wallMat = new THREE.MeshStandardMaterial({{ color: 0x8ea9c1 }});
+    segments.forEach(function (seg) {{
+        const x0 = seg[0], y0 = seg[1], x1 = seg[2], y1 = seg[3];
+        const dx = x1 - x0, dy = y1 - y0;
+        const length = Math.sqrt(dx * dx + dy * dy);
+        if (length < 1) return;
+        const mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(length, wallHeight, wallThickness),
+            wallMat
+        );
+        mesh.position.set((x0 + x1) / 2, wallHeight / 2, (y0 + y1) / 2);
+        mesh.rotation.y = -Math.atan2(dy, dx);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+    }});
+
+    function animate() {{
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }}
+    animate();
+
+    window.addEventListener('resize', function () {{
+        camera.aspect = container.clientWidth / 600;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, 600);
+    }});
+}})();
+</script>
+"""

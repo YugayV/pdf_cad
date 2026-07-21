@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
+import streamlit.components.v1 as components
 from agent import get_agent
 from tools import (
     analyze_pdf_visuals_structured,
     calculate_estimate,
     extract_room_schedule,
     extract_text_from_pdf,
+    generate_3d_preview_html,
     generate_dxf_file,
     get_pdf_page_count,
     load_input_as_pdf_bytes,
@@ -79,7 +81,7 @@ st.markdown("""
 for key in (
     "pdf_bytes", "excel_df", "dxf_data", "dxf_doc", "agent_response",
     "detected_objects", "estimate_df", "estimate_total", "pdf_preview_bytes",
-    "room_schedule", "room_schedule_total", "chat_agent",
+    "room_schedule", "room_schedule_total", "chat_agent", "preview_3d_html",
 ):
     if key not in st.session_state:
         st.session_state[key] = None
@@ -325,6 +327,39 @@ with tab5:
                 st.info("Нет позиций с рассчитанной суммой для отображения.")
         else:
             st.info("Сначала выполните расчёт сметы на вкладке «Подсчёт и смета».")
+
+    st.markdown("---")
+    st.markdown("##### 🧊 3D-модель плана")
+    st.caption(
+        "Стены выдавливаются из линий/прямоугольников выбранной страницы чертежа. Мышью можно вращать и "
+        "приближать. Использует масштаб со вкладки «Экспорт AutoCAD» — если пропорции выглядят странно, "
+        "настройте масштаб там."
+    )
+
+    wall3d_col, thickness3d_col, build3d_col = st.columns([1, 1, 1])
+    with wall3d_col:
+        st.number_input("Высота стен, мм", min_value=100, value=2700, step=100, key="preview_3d_wall_height")
+    with thickness3d_col:
+        st.number_input("Толщина стен, мм", min_value=10, value=150, step=10, key="preview_3d_wall_thickness")
+    with build3d_col:
+        st.markdown("")
+        st.markdown("")
+        if st.button("🧊 Построить 3D-модель", use_container_width=True):
+            if not st.session_state.pdf_bytes:
+                st.warning("Сначала загрузите PDF в левом меню.")
+            else:
+                with st.spinner("Строю 3D-модель..."):
+                    st.session_state.preview_3d_html = generate_3d_preview_html(
+                        wall_height_mm=st.session_state.get("preview_3d_wall_height", 2700),
+                        wall_thickness_mm=st.session_state.get("preview_3d_wall_thickness", 150),
+                        scale=st.session_state.get("dxf_scale", 1.0),
+                        page_number=st.session_state.get("page_number", 1),
+                    )
+
+    if st.session_state.preview_3d_html:
+        components.html(st.session_state.preview_3d_html, height=620, scrolling=False)
+    else:
+        st.info("Нажмите «Построить 3D-модель», чтобы выдавить стены выбранной страницы чертежа в 3D.")
 
 with tab6:
     st.markdown("#### CAD-чат: правки и дополнения к чертежу")
