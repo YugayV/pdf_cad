@@ -621,6 +621,24 @@ def generate_3d_preview_html(
     if not segments:
         return ""
 
+    # Auto-normalize footprint size relative to wall height. Users often build the 3D view
+    # without first calibrating a real-world scale on the DXF export tab, so the footprint
+    # frequently stays in raw PDF-point units (a few hundred units across) while wall_height_mm
+    # is a real value like 2700 - the whole building then collapses into one indistinguishable
+    # pillar because every wall is far taller than the plan is wide. A real building footprint
+    # spans many times its own wall height, so if it doesn't, rescale the geometry (not the
+    # wall height, which the user set deliberately) until it does.
+    xs = [pt for seg in segments for pt in (seg[0], seg[2])]
+    ys = [pt for seg in segments for pt in (seg[1], seg[3])]
+    footprint_size = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    target_footprint = wall_height_mm * 3
+    if footprint_size < target_footprint:
+        auto_factor = target_footprint / footprint_size
+        segments = [
+            (x0 * auto_factor, y0 * auto_factor, x1 * auto_factor, y1 * auto_factor)
+            for x0, y0, x1, y1 in segments
+        ]
+
     three_js = _read_vendor_js("three.min.js")
     orbit_controls_js = _read_vendor_js("OrbitControls.js")
     segments_json = json.dumps(segments)
