@@ -1,6 +1,7 @@
 import base64
 import io
-from typing import List, Optional
+import re
+from typing import List, Optional, Tuple
 
 import ezdxf
 import fitz  # PyMuPDF
@@ -11,32 +12,53 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-def extract_text_from_pdf(query: str = "") -> str:
-    """Извлекает весь текст из загруженного PDF чертежа. Используй, если нужно найти размеры, надписи или спецификации."""
+SUPPORTED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
+
+
+def load_input_as_pdf_bytes(file_bytes: bytes, filename: str) -> bytes:
+    """Принимает содержимое загруженного файла (PDF или изображение JPG/JPEG/PNG) и возвращает PDF-байты.
+    Изображения оборачиваются в PDF из одной страницы, чтобы дальше все инструменты (текст, DXF, Vision,
+    экспликация) работали единообразно независимо от исходного формата."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext == "pdf":
+        return file_bytes
+    if ext in SUPPORTED_IMAGE_EXTENSIONS:
+        image_filetype = "jpeg" if ext in ("jpg", "jpeg") else ext
+        img_doc = fitz.open(stream=file_bytes, filetype=image_filetype)
+        try:
+            return img_doc.convert_to_pdf()
+        finally:
+            img_doc.close()
+    raise ValueError(f"Неподдерживаемый формат файла: .{ext or '?'}. Поддерживаются PDF, JPG/JPEG, PNG.")
+
+
+def get_pdf_page_count() -> int:
+    """Возвращает количество страниц в загруженном PDF (0, если PDF не загружен)."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
-        return "PDF не загружен."
-    text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() + "\n"
-    return text[:3000] # Ограничиваем для контекста
-
-def analyze_pdf_visuals(query: str = "") -> str:
-    """Анализирует визуальную часть PDF (чертеж) с помощью ИИ. Используй, чтобы найти объекты (шкафы, стены), посчитать их количество или понять геометрию."""
-    pdf_bytes = st.session_state.get("pdf_bytes")
-    if not pdf_bytes:
-        return "PDF не загружен."
-
-    # Конвертируем первую страницу PDF в картинку
+        return 0
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
-    pix = page.get_pixmap()
-    img_bytes = pix.tobytes("png")
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
 
-    # Возвращаем путь к картинке для Vision-модели (обработка в agent.py)
-    st.session_state["pdf_image_bytes"] = img_bytes
-    return "Изображение первой страницы PDF сохранено. Передай его в систему для визуального анализа."
+
+def extract_text_from_pdf(query: str = "") -> str:
+    """Извлекает весь текст из загруженного PDF чертежа (по всем страницам). Используй, если нужно найти
+    размеры, надписи или спецификации."""
+    pdf_bytes = st.session_state.get("pdf_bytes")
+    if not pdf_bytes:
+        return "PDF не загружен."
+    # Используем PyMuPDF, а не pdfplumber: pdfplumber реконструирует раскладку текста относительно ВСЕХ
+    # векторных объектов на странице, что на чертежах с десятками/сотнями тысяч линий (штриховка, детальные
+    # планы) может занимать десятки секунд на страницу; PyMuPDF не имеет этой проблемы.
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        text = "".join(page.get_text() + "\n" for page in doc)
+    finally:
+        doc.close()
+    return text[:3000]  # Ограничиваем для контекста
 
 
 class DetectedObject(BaseModel):
@@ -53,15 +75,19 @@ class DrawingAnalysis(BaseModel):
     summary: str = Field(default="", description="Краткое текстовое резюме анализа чертежа")
 
 
-def analyze_pdf_visuals_structured(query: str = "") -> str:
+def analyze_pdf_visuals_structured(query: str = "", page_number: int = 1) -> str:
     """Анализирует визуальную часть PDF-чертежа через GPT-4o Vision и возвращает СТРУКТУРИРОВАННЫЙ список объектов
-    (название, количество, единица измерения, габариты). Используй для точного подсчета объектов перед расчетом сметы."""
+    (название, количество, единица измерения, габариты). Используй для точного подсчета объектов перед расчетом сметы.
+    page_number - номер страницы для анализа, считая с 1 (в многостраничном проекте разные страницы - это разные
+    планы/разрезы, их нельзя анализировать все вместе)."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return "PDF не загружен."
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
+    if not (1 <= page_number <= doc.page_count):
+        return f"Неверный номер страницы: {page_number}. В документе {doc.page_count} стр."
+    page = doc.load_page(page_number - 1)
     pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
     img_bytes = pix.tobytes("png")
     st.session_state["pdf_image_bytes"] = img_bytes
@@ -204,6 +230,55 @@ class RoomEntry(BaseModel):
     area_m2: float = Field(description="Площадь помещения в м2")
 
 
+MAX_PAGE_DRAWING_OBJECTS = 5000  # выше этого порога страница - это детальный чертеж, а не таблица; пропускаем
+
+
+def _simple_pages(pdf_bytes: bytes) -> set:
+    """Быстро (через PyMuPDF) находит страницы с небольшим числом векторных объектов - таблицы и текстовые
+    листы. Детальные чертежи (штриховка, десятки тысяч линий) на порядок медленнее разбираются в pdfplumber,
+    поэтому такие страницы нужно заранее исключать из тяжелых операций (поиск таблиц), чтобы не подвешивать
+    обработку на несколько минут."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return {i for i, page in enumerate(doc) if len(page.get_drawings()) <= MAX_PAGE_DRAWING_OBJECTS}
+    finally:
+        doc.close()
+
+
+ROOM_LIST_LINE = re.compile(r"^(\d{1,3})\.\s*(.+?)\s*[-–—]\s*(\d+[.,]?\d*)\s*(?:м2|м²|m2)?$", re.IGNORECASE)
+AREA_TOKEN = re.compile(r"(\d+[.,]?\d*)\s*(?:м2|м²|m2)", re.IGNORECASE)
+
+
+def _parse_room_list_text(text: str) -> Tuple[List["RoomEntry"], Optional[float]]:
+    """Резервный разбор экспликации, оформленной обычным нумерованным списком в тексте чертежа
+    (например '1. ТАМБУР - 8,6' ... 'ИТОГО: S ПОЛЕЗНАЯ - 150,0 М2'), а не бордюрной таблицей."""
+    rooms: List[RoomEntry] = []
+    total: Optional[float] = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = ROOM_LIST_LINE.match(line)
+        if match:
+            number, name, area_raw = match.groups()
+            try:
+                area = float(area_raw.replace(",", "."))
+            except ValueError:
+                continue
+            rooms.append(RoomEntry(number=number, name=name.strip(), area_m2=area))
+            continue
+        if "итого" in line.lower():
+            # Берем ПОСЛЕДНЕЕ число вида "N м2" в строке - само слово "итого" и текст перед числом
+            # (например "S ПОЛЕЗНАЯ 1-ГО ЭТАЖА") часто содержат посторонние цифры.
+            area_tokens = AREA_TOKEN.findall(line)
+            if area_tokens:
+                try:
+                    total = float(area_tokens[-1].replace(",", "."))
+                except ValueError:
+                    pass
+    return rooms, total
+
+
 def extract_room_schedule() -> str:
     """Извлекает таблицу экспликации помещений (№, наименование, площадь) из PDF-чертежа, если она есть,
     и сверяет сумму площадей с итоговой площадью в таблице. Используй для точного подсчета площадей комнат."""
@@ -213,9 +288,14 @@ def extract_room_schedule() -> str:
 
     rooms: List[RoomEntry] = []
     stated_total: Optional[float] = None
+    simple_pages = _simple_pages(pdf_bytes)
+    skipped = 0
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages):
+            if page_index not in simple_pages:
+                skipped += 1
+                continue
             for table in page.extract_tables():
                 if not table or not table[0]:
                     continue
@@ -245,8 +325,29 @@ def extract_room_schedule() -> str:
                         continue
                     rooms.append(RoomEntry(number=number, name=name, area_m2=area))
 
+    skip_note = f" ({skipped} стр. пропущено как слишком детальные чертежи)" if skipped else ""
+    list_fallback = False
     if not rooms:
-        return "Таблица экспликации помещений не найдена в PDF (нет извлекаемого текстового слоя с колонками 'Наименование'/'Площадь')."
+        # Резервный вариант: помещения оформлены нумерованным текстовым списком, а не таблицей.
+        # Текстовое извлечение через PyMuPDF быстрое даже на очень детальных страницах, поэтому
+        # здесь можно смотреть весь документ без ограничения по сложности страницы.
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            for page in doc:
+                found_rooms, found_total = _parse_room_list_text(page.get_text())
+                if found_rooms:
+                    rooms.extend(found_rooms)
+                    if found_total is not None:
+                        stated_total = found_total
+                    list_fallback = True
+        finally:
+            doc.close()
+
+    if not rooms:
+        return (
+            "Таблица/список экспликации помещений не найдены в PDF (нет извлекаемого текста с колонками "
+            f"'Наименование'/'Площадь' и нет нумерованного списка вида '1. Название - Площадь'){skip_note}."
+        )
 
     st.session_state["room_schedule"] = [r.model_dump() for r in rooms]
     computed_total = round(sum(r.area_m2 for r in rooms), 2)
@@ -262,17 +363,20 @@ def extract_room_schedule() -> str:
             else f" Совпадает с указанной в чертеже общей площадью ({stated_total} м2)."
         )
 
-    return f"Помещений найдено: {len(rooms)}. Суммарная площадь: {computed_total} м2.{check} " + "; ".join(lines)
+    source_note = " (формат: нумерованный список)" if list_fallback else ""
+    return f"Помещений найдено: {len(rooms)}. Суммарная площадь: {computed_total} м2.{check}{skip_note}{source_note} " + "; ".join(lines)
 
 
-def render_pdf_preview(dpi: int = 150) -> Optional[bytes]:
-    """Рендерит первую страницу PDF-чертежа в PNG для визуального предпросмотра в интерфейсе."""
+def render_pdf_preview(dpi: int = 150, page_number: int = 1) -> Optional[bytes]:
+    """Рендерит страницу PDF-чертежа в PNG для визуального предпросмотра в интерфейсе.
+    page_number - номер страницы, считая с 1."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return None
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
+    page_number = max(1, min(page_number, doc.page_count))
+    page = doc.load_page(page_number - 1)
     zoom = dpi / 72
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img_bytes = pix.tobytes("png")
@@ -312,12 +416,18 @@ def _export_dxf_doc(doc) -> bytes:
     return data
 
 
-def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0) -> str:
-    """Генерирует файл AutoCAD (.dxf) на основе извлеченных из PDF векторных линий, прямоугольников и кривых.
-    Начинает новый CAD-проект в памяти, к которому потом можно добавлять элементы через чат (add_wall и т.п.).
-    scale - коэффициент масштабирования (мм на единицу PDF), позволяет привести чертеж к реальным размерам.
-    wall_height_mm - если больше 0, линии и прямоугольники получают вертикальную экструзию (thickness) на эту
-    высоту в мм — при открытии в AutoCAD они отображаются как 3D-стены (псевдо-3D)."""
+MAX_DXF_ENTITIES = 200_000  # защита от многочасовой генерации/неоткрываемых файлов на сверхдетальных чертежах
+
+
+def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number: int = 1) -> str:
+    """Генерирует файл AutoCAD (.dxf) на основе извлеченных из PDF векторных линий, прямоугольников и кривых
+    ОДНОЙ страницы. Начинает новый CAD-проект в памяти, к которому потом можно добавлять элементы через чат
+    (add_wall и т.п.). scale - коэффициент масштабирования (мм на единицу PDF), позволяет привести чертеж к
+    реальным размерам. wall_height_mm - если больше 0, линии и прямоугольники получают вертикальную экструзию
+    (thickness) на эту высоту в мм — при открытии в AutoCAD они отображаются как 3D-стены (псевдо-3D).
+    page_number - номер страницы для конвертации, считая с 1 (в многостраничном проекте страницы обычно
+    содержат разные, несовместимые по масштабу и содержанию виды - план, разрезы, фасады - поэтому
+    конвертируется только одна выбранная страница, а не все сразу)."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return "PDF не загружен, невозможно создать DXF."
@@ -325,44 +435,61 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0) -> str:
     doc = _new_dxf_doc()
     msp = doc.modelspace()
     total_entities = 0
+    truncated = False
     wall_attribs = {"thickness": wall_height_mm} if wall_height_mm else {}
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            h = page.height
+        if not (1 <= page_number <= len(pdf.pages)):
+            return f"Неверный номер страницы: {page_number}. В документе {len(pdf.pages)} стр."
+        page = pdf.pages[page_number - 1]
+        h = page.height
 
-            def to_dxf(x, y, h=h):
-                return (round(x * scale, 3), round((h - y) * scale, 3))
+        def to_dxf(x, y):
+            return (round(x * scale, 3), round((h - y) * scale, 3))
 
-            for line in page.lines:
-                start = to_dxf(line["x0"], line["y0"])
-                end = to_dxf(line["x1"], line["y1"])
-                msp.add_line(start, end, dxfattribs={"layer": "LINES", **wall_attribs})
+        for line in page.lines:
+            if total_entities >= MAX_DXF_ENTITIES:
+                truncated = True
+                break
+            start = to_dxf(line["x0"], line["y0"])
+            end = to_dxf(line["x1"], line["y1"])
+            msp.add_line(start, end, dxfattribs={"layer": "LINES", **wall_attribs})
+            total_entities += 1
+
+        for rect in page.rects:
+            if total_entities >= MAX_DXF_ENTITIES:
+                truncated = True
+                break
+            x0, y0, x1, y1 = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
+            points = [to_dxf(x0, y0), to_dxf(x1, y0), to_dxf(x1, y1), to_dxf(x0, y1)]
+            msp.add_lwpolyline(points, close=True, dxfattribs={"layer": "RECTS", **wall_attribs})
+            total_entities += 1
+
+        for curve in page.curves:
+            if total_entities >= MAX_DXF_ENTITIES:
+                truncated = True
+                break
+            pts = curve.get("pts") or []
+            if len(pts) >= 2:
+                points = [to_dxf(px, py) for px, py in pts]
+                msp.add_lwpolyline(points, dxfattribs={"layer": "CURVES"})
                 total_entities += 1
-
-            for rect in page.rects:
-                x0, y0, x1, y1 = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
-                points = [to_dxf(x0, y0), to_dxf(x1, y0), to_dxf(x1, y1), to_dxf(x0, y1)]
-                msp.add_lwpolyline(points, close=True, dxfattribs={"layer": "RECTS", **wall_attribs})
-                total_entities += 1
-
-            for curve in page.curves:
-                pts = curve.get("pts") or []
-                if len(pts) >= 2:
-                    points = [to_dxf(px, py) for px, py in pts]
-                    msp.add_lwpolyline(points, dxfattribs={"layer": "CURVES"})
-                    total_entities += 1
 
     if total_entities == 0:
-        return "В PDF не найдено векторных линий/фигур для конвертации в DXF."
+        return f"На странице {page_number} не найдено векторных линий/фигур для конвертации в DXF."
 
     st.session_state["dxf_doc"] = doc
     _export_dxf_doc(doc)
     extrusion_note = f", экструзия стен {wall_height_mm} мм (псевдо-3D)" if wall_height_mm else ""
+    truncation_note = (
+        f" Внимание: чертеж очень детальный, перенесены первые {MAX_DXF_ENTITIES} объектов из большего числа."
+        if truncated
+        else ""
+    )
     return (
-        f"DXF файл успешно сгенерирован ({total_entities} объектов, масштаб {scale}{extrusion_note}) "
-        "и готов к скачиванию. Этот чертеж также стал текущим CAD-проектом — можно добавлять "
-        "элементы командами в чате."
+        f"DXF файл успешно сгенерирован (стр. {page_number}, {total_entities} объектов, масштаб {scale}"
+        f"{extrusion_note}) и готов к скачиванию. Этот чертеж также стал текущим CAD-проектом — можно "
+        f"добавлять элементы командами в чате.{truncation_note}"
     )
 
 

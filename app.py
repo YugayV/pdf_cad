@@ -7,6 +7,8 @@ from tools import (
     extract_room_schedule,
     extract_text_from_pdf,
     generate_dxf_file,
+    get_pdf_page_count,
+    load_input_as_pdf_bytes,
     render_pdf_preview,
     search_excel_price,
     summarize_smeta_costs,
@@ -83,17 +85,40 @@ for key in (
         st.session_state[key] = None
 if "chat_log" not in st.session_state:
     st.session_state.chat_log = []
+if "page_number" not in st.session_state:
+    st.session_state.page_number = 1
 
 # --- БОКОВОЕ МЕНЮ (ЗАГРУЗКА ДОКУМЕНТОВ) ---
 with st.sidebar:
     st.markdown("### 📂 Документы")
     st.markdown("Загрузите файлы для анализа")
     
-    uploaded_pdf = st.file_uploader("PDF Чертеж", type=["pdf"], label_visibility="collapsed")
+    uploaded_pdf = st.file_uploader(
+        "Чертеж (PDF, JPG, JPEG, PNG)", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed",
+    )
     if uploaded_pdf:
-        st.session_state.pdf_bytes = uploaded_pdf.getvalue()
-        st.success("✅ PDF загружен", icon="✅")
-        
+        try:
+            st.session_state.pdf_bytes = load_input_as_pdf_bytes(uploaded_pdf.getvalue(), uploaded_pdf.name)
+            if uploaded_pdf.name.lower().endswith((".pdf",)):
+                st.success("✅ PDF загружен", icon="✅")
+            else:
+                st.success("✅ Изображение загружено и сконвертировано в PDF", icon="✅")
+        except Exception as e:
+            st.error(f"Не удалось обработать файл: {e}")
+
+    if st.session_state.pdf_bytes:
+        page_count = get_pdf_page_count()
+        if page_count > 1:
+            st.number_input(
+                f"Страница чертежа (всего {page_count})",
+                min_value=1, max_value=page_count, value=1, step=1, key="page_number",
+                help="Многостраничный документ: план, разрезы, фасады, экспликации — обычно на разных "
+                     "страницах, поэтому анализ/DXF/предпросмотр работают с одной выбранной страницей.",
+            )
+        else:
+            st.session_state.page_number = 1
+
+
     uploaded_excel = st.file_uploader("Excel Смета", type=["xlsx", "xls"], label_visibility="collapsed")
     if uploaded_excel:
         try:
@@ -166,6 +191,7 @@ with tab1:
                     st.session_state.agent_response = generate_dxf_file(
                         st.session_state.get("dxf_scale", 1.0),
                         st.session_state.get("dxf_wall_height", 0),
+                        st.session_state.get("page_number", 1),
                     )
 
     render_agent_response("💡 Здесь появятся результаты локальной обработки PDF, Excel или DXF.")
@@ -185,7 +211,9 @@ with tab2:
                 st.session_state.agent_response = "Сначала загрузите PDF в левом меню."
             else:
                 with st.spinner("Анализирую чертеж..."):
-                    st.session_state.agent_response = analyze_pdf_visuals_structured(vision_query.strip())
+                    st.session_state.agent_response = analyze_pdf_visuals_structured(
+                        vision_query.strip(), st.session_state.get("page_number", 1)
+                    )
 
     with calc_col:
         if st.button("💰 Рассчитать смету (по объектам)", use_container_width=True):
@@ -281,7 +309,7 @@ with tab5:
             if not st.session_state.pdf_bytes:
                 st.warning("Сначала загрузите PDF в левом меню.")
             else:
-                render_pdf_preview()
+                render_pdf_preview(page_number=st.session_state.get("page_number", 1))
         if st.session_state.pdf_preview_bytes:
             st.image(st.session_state.pdf_preview_bytes, use_container_width=True)
         else:
