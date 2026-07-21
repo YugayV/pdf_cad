@@ -1,8 +1,10 @@
 import streamlit as st
 import pandas as pd
+from agent import get_agent
 from tools import (
     analyze_pdf_visuals_structured,
     calculate_estimate,
+    extract_room_schedule,
     extract_text_from_pdf,
     generate_dxf_file,
     render_pdf_preview,
@@ -73,11 +75,14 @@ st.markdown("""
 
 # --- ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ---
 for key in (
-    "pdf_bytes", "excel_df", "dxf_data", "agent_response",
+    "pdf_bytes", "excel_df", "dxf_data", "dxf_doc", "agent_response",
     "detected_objects", "estimate_df", "estimate_total", "pdf_preview_bytes",
+    "room_schedule", "room_schedule_total", "chat_agent",
 ):
     if key not in st.session_state:
         st.session_state[key] = None
+if "chat_log" not in st.session_state:
+    st.session_state.chat_log = []
 
 # --- БОКОВОЕ МЕНЮ (ЗАГРУЗКА ДОКУМЕНТОВ) ---
 with st.sidebar:
@@ -99,14 +104,30 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Ошибка Excel: {e}")
 
+def render_agent_response(empty_message: str) -> None:
+    if st.session_state.agent_response:
+        st.markdown("---")
+        st.markdown("#### 📝 Результат:")
+        st.markdown(
+            f"""
+            <div style="background-color: #ffffff; padding: 20px; border-radius: 10px; border-left: 4px solid #2c3e50; margin-top: 10px;">
+                <p style="color: #333; line-height: 1.6;">{st.session_state.agent_response}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info(empty_message)
+
+
 # --- ГЛАВНЫЙ ЭКРАН ---
 st.markdown("## 📐 PDF → AutoCAD: анализ, подсчёт и графика")
-st.markdown("Загрузите документы в левом меню: извлечение текста, ИИ-подсчёт объектов, расчёт сметы, генерация DXF и визуализация.")
+st.markdown("Загрузите документы в левом меню: извлечение текста, ИИ-подсчёт объектов, расчёт сметы, генерация DXF (в т.ч. псевдо-3D) и визуализация.")
 st.markdown("---")
 
 # Создаем вкладки
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🤖 Рабочая область", "🧮 Подсчёт и смета", "📊 Таблица сметы", "⬇️ Экспорт AutoCAD", "📈 Графика",
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🤖 Рабочая область", "🧮 Подсчёт и смета", "📊 Таблица сметы", "⬇️ Экспорт AutoCAD", "📈 Графика", "💬 CAD-чат",
 ])
 
 with tab1:
@@ -142,21 +163,12 @@ with tab1:
                 st.session_state.agent_response = "Сначала загрузите PDF в левом меню."
             else:
                 with st.spinner("Генерирую DXF..."):
-                    st.session_state.agent_response = generate_dxf_file(st.session_state.get("dxf_scale", 1.0))
+                    st.session_state.agent_response = generate_dxf_file(
+                        st.session_state.get("dxf_scale", 1.0),
+                        st.session_state.get("dxf_wall_height", 0),
+                    )
 
-    if st.session_state.agent_response:
-        st.markdown("---")
-        st.markdown("#### 📝 Результат:")
-        st.markdown(
-            f"""
-            <div style="background-color: #ffffff; padding: 20px; border-radius: 10px; border-left: 4px solid #2c3e50; margin-top: 10px;">
-                <p style="color: #333; line-height: 1.6;">{st.session_state.agent_response}</p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-    else:
-        st.info("💡 Здесь появятся результаты локальной обработки PDF, Excel или DXF.")
+    render_agent_response("💡 Здесь появятся результаты локальной обработки PDF, Excel или DXF.")
 
 with tab2:
     st.markdown("#### Подсчёт объектов на чертеже и расчёт сметы")
@@ -197,6 +209,22 @@ with tab2:
         st.dataframe(st.session_state.estimate_df, use_container_width=True)
         st.metric("Итоговая стоимость", f"{st.session_state.estimate_total:,.2f}")
 
+    st.markdown("---")
+    st.markdown("##### Площади помещений (экспликация)")
+    st.caption("Работает локально без ИИ, если в PDF есть таблица с колонками «Наименование»/«Площадь».")
+    if st.button("📐 Извлечь экспликацию помещений"):
+        if not st.session_state.pdf_bytes:
+            st.session_state.agent_response = "Сначала загрузите PDF в левом меню."
+        else:
+            with st.spinner("Ищу таблицу помещений..."):
+                st.session_state.agent_response = extract_room_schedule()
+
+    if st.session_state.room_schedule:
+        st.dataframe(pd.DataFrame(st.session_state.room_schedule), use_container_width=True)
+        st.metric("Суммарная площадь", f"{st.session_state.room_schedule_total} м²")
+
+    render_agent_response("💡 Здесь появятся результаты подсчёта объектов, сметы и площадей.")
+
 with tab3:
     st.markdown("#### Данные сметы")
     if st.session_state.excel_df is not None:
@@ -211,11 +239,19 @@ with tab3:
 
 with tab4:
     st.markdown("#### Экспорт в AutoCAD")
-    st.number_input(
-        "Масштаб (мм на единицу PDF)",
-        min_value=0.001, value=1.0, step=0.1, key="dxf_scale",
-        help="Например 0.3528 для перевода точек PDF (1/72 дюйма) в миллиметры 1:1, либо реальный масштаб чертежа.",
-    )
+    scale_col, height_col = st.columns(2)
+    with scale_col:
+        st.number_input(
+            "Масштаб (мм на единицу PDF)",
+            min_value=0.001, value=1.0, step=0.1, key="dxf_scale",
+            help="Например 0.3528 для перевода точек PDF (1/72 дюйма) в миллиметры 1:1, либо реальный масштаб чертежа.",
+        )
+    with height_col:
+        st.number_input(
+            "Высота стен, мм (0 = без 3D)",
+            min_value=0, value=0, step=100, key="dxf_wall_height",
+            help="Если больше 0, линии и прямоугольники чертежа получают вертикальную экструзию (псевдо-3D) на эту высоту.",
+        )
     if st.session_state.dxf_data:
         st.success("Файл успешно сгенерирован локально!")
 
@@ -261,3 +297,41 @@ with tab5:
                 st.info("Нет позиций с рассчитанной суммой для отображения.")
         else:
             st.info("Сначала выполните расчёт сметы на вкладке «Подсчёт и смета».")
+
+with tab6:
+    st.markdown("#### CAD-чат: правки и дополнения к чертежу")
+    st.caption(
+        "Опишите, что добавить или изменить в текущем CAD-проекте — например «добавь стену от (0,0) до "
+        "(5000,0) высотой 2700 мм» или «покажи, что сейчас есть в проекте». Требует ключ OPENAI_API_KEY. "
+        "Начните с вкладки «Экспорт AutoCAD», чтобы загрузить чертёж из PDF как основу проекта, либо стройте "
+        "его с нуля прямо здесь."
+    )
+
+    for role, content in st.session_state.chat_log:
+        with st.chat_message(role):
+            st.markdown(content)
+
+    chat_prompt = st.chat_input("Например: добавь стену от (0,0) до (5000,0) высотой 2700 мм")
+    if chat_prompt:
+        st.session_state.chat_log.append(("user", chat_prompt))
+        with st.chat_message("user"):
+            st.markdown(chat_prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Обрабатываю..."):
+                try:
+                    if st.session_state.chat_agent is None:
+                        st.session_state.chat_agent = get_agent()
+                    result = st.session_state.chat_agent.invoke({"input": chat_prompt})
+                    answer = result.get("output", str(result))
+                except Exception as e:
+                    answer = f"Ошибка чат-агента (проверьте OPENAI_API_KEY): {e}"
+            st.markdown(answer)
+        st.session_state.chat_log.append(("assistant", answer))
+
+    if st.session_state.dxf_data:
+        st.download_button(
+            "⬇️ Скачать текущий CAD-проект (.dxf)",
+            data=st.session_state.dxf_data,
+            file_name="cad_project.dxf",
+            mime="application/dxf",
+        )

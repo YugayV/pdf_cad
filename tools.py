@@ -198,6 +198,73 @@ def calculate_estimate() -> str:
     return f"Расчет выполнен. Позиций: {len(rows)}. Итоговая стоимость: {total:,.2f}.{warning}"
 
 
+class RoomEntry(BaseModel):
+    number: str = Field(description="Номер помещения, например '101'")
+    name: str = Field(description="Название помещения, например 'Кухня-столовая'")
+    area_m2: float = Field(description="Площадь помещения в м2")
+
+
+def extract_room_schedule() -> str:
+    """Извлекает таблицу экспликации помещений (№, наименование, площадь) из PDF-чертежа, если она есть,
+    и сверяет сумму площадей с итоговой площадью в таблице. Используй для точного подсчета площадей комнат."""
+    pdf_bytes = st.session_state.get("pdf_bytes")
+    if not pdf_bytes:
+        return "PDF не загружен."
+
+    rooms: List[RoomEntry] = []
+    stated_total: Optional[float] = None
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if not table or not table[0]:
+                    continue
+                header = [str(c or "").strip().lower() for c in table[0]]
+                if not any("наимен" in c for c in header) or not any("площад" in c for c in header):
+                    continue
+
+                name_idx = next((i for i, c in enumerate(header) if "наимен" in c), 1)
+                area_idx = next((i for i, c in enumerate(header) if "площад" in c), len(header) - 1)
+                num_idx = next((i for i, c in enumerate(header) if c.strip() in ("№", "n", "no")), 0)
+
+                for data_row in table[1:]:
+                    if not data_row or len(data_row) <= max(name_idx, area_idx):
+                        continue
+                    name = str(data_row[name_idx] or "").strip()
+                    area_raw = str(data_row[area_idx] or "").strip().replace(",", ".")
+                    number = str(data_row[num_idx] or "").strip()
+                    if not name and not area_raw:
+                        continue
+                    try:
+                        area = float(area_raw)
+                    except ValueError:
+                        continue
+                    if not number.isdigit() and area:
+                        # Итоговая строка без номера (например "99,51 м²")
+                        stated_total = area
+                        continue
+                    rooms.append(RoomEntry(number=number, name=name, area_m2=area))
+
+    if not rooms:
+        return "Таблица экспликации помещений не найдена в PDF (нет извлекаемого текстового слоя с колонками 'Наименование'/'Площадь')."
+
+    st.session_state["room_schedule"] = [r.model_dump() for r in rooms]
+    computed_total = round(sum(r.area_m2 for r in rooms), 2)
+    st.session_state["room_schedule_total"] = computed_total
+
+    lines = [f"{r.number} {r.name}: {r.area_m2} м2" for r in rooms]
+    check = ""
+    if stated_total is not None:
+        diff = round(computed_total - stated_total, 2)
+        check = (
+            f" Указанная в чертеже общая площадь: {stated_total} м2. Расхождение с суммой по помещениям: {diff} м2."
+            if abs(diff) > 0.01
+            else f" Совпадает с указанной в чертеже общей площадью ({stated_total} м2)."
+        )
+
+    return f"Помещений найдено: {len(rooms)}. Суммарная площадь: {computed_total} м2.{check} " + "; ".join(lines)
+
+
 def render_pdf_preview(dpi: int = 150) -> Optional[bytes]:
     """Рендерит первую страницу PDF-чертежа в PNG для визуального предпросмотра в интерфейсе."""
     pdf_bytes = st.session_state.get("pdf_bytes")
@@ -213,23 +280,52 @@ def render_pdf_preview(dpi: int = 150) -> Optional[bytes]:
     return img_bytes
 
 
-def generate_dxf_file(scale: float = 1.0) -> str:
+DEFAULT_LAYERS = (
+    ("LINES", 7), ("RECTS", 5), ("CURVES", 3), ("WALLS", 1), ("LABELS", 2),
+)
+
+
+def _new_dxf_doc() -> "ezdxf.document.Drawing":
+    doc = ezdxf.new("R2010", setup=True)
+    doc.units = ezdxf.units.MM
+    doc.header["$INSUNITS"] = ezdxf.units.MM
+    for layer_name, color in DEFAULT_LAYERS:
+        if layer_name not in doc.layers:
+            doc.layers.add(layer_name, dxfattribs={"color": color})
+    return doc
+
+
+def _get_dxf_doc() -> "ezdxf.document.Drawing":
+    """Возвращает текущий CAD-проект в памяти (создает новый пустой, если его еще нет)."""
+    doc = st.session_state.get("dxf_doc")
+    if doc is None:
+        doc = _new_dxf_doc()
+        st.session_state["dxf_doc"] = doc
+    return doc
+
+
+def _export_dxf_doc(doc) -> bytes:
+    buffer = io.StringIO()
+    doc.write(buffer)
+    data = buffer.getvalue().encode("utf-8")
+    st.session_state["dxf_data"] = data
+    return data
+
+
+def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0) -> str:
     """Генерирует файл AutoCAD (.dxf) на основе извлеченных из PDF векторных линий, прямоугольников и кривых.
-    scale - коэффициент масштабирования (мм на единицу PDF), позволяет привести чертеж к реальным размерам."""
+    Начинает новый CAD-проект в памяти, к которому потом можно добавлять элементы через чат (add_wall и т.п.).
+    scale - коэффициент масштабирования (мм на единицу PDF), позволяет привести чертеж к реальным размерам.
+    wall_height_mm - если больше 0, линии и прямоугольники получают вертикальную экструзию (thickness) на эту
+    высоту в мм — при открытии в AutoCAD они отображаются как 3D-стены (псевдо-3D)."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return "PDF не загружен, невозможно создать DXF."
 
-    doc = ezdxf.new("R2010", setup=True)
-    doc.units = ezdxf.units.MM
-    doc.header["$INSUNITS"] = ezdxf.units.MM
-
-    for layer_name, color in (("LINES", 7), ("RECTS", 5), ("CURVES", 3)):
-        if layer_name not in doc.layers:
-            doc.layers.add(layer_name, dxfattribs={"color": color})
-
+    doc = _new_dxf_doc()
     msp = doc.modelspace()
     total_entities = 0
+    wall_attribs = {"thickness": wall_height_mm} if wall_height_mm else {}
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -241,13 +337,13 @@ def generate_dxf_file(scale: float = 1.0) -> str:
             for line in page.lines:
                 start = to_dxf(line["x0"], line["y0"])
                 end = to_dxf(line["x1"], line["y1"])
-                msp.add_line(start, end, dxfattribs={"layer": "LINES"})
+                msp.add_line(start, end, dxfattribs={"layer": "LINES", **wall_attribs})
                 total_entities += 1
 
             for rect in page.rects:
                 x0, y0, x1, y1 = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
                 points = [to_dxf(x0, y0), to_dxf(x1, y0), to_dxf(x1, y1), to_dxf(x0, y1)]
-                msp.add_lwpolyline(points, close=True, dxfattribs={"layer": "RECTS"})
+                msp.add_lwpolyline(points, close=True, dxfattribs={"layer": "RECTS", **wall_attribs})
                 total_entities += 1
 
             for curve in page.curves:
@@ -260,7 +356,76 @@ def generate_dxf_file(scale: float = 1.0) -> str:
     if total_entities == 0:
         return "В PDF не найдено векторных линий/фигур для конвертации в DXF."
 
-    buffer = io.StringIO()
-    doc.write(buffer)
-    st.session_state["dxf_data"] = buffer.getvalue().encode("utf-8")
-    return f"DXF файл успешно сгенерирован ({total_entities} объектов, масштаб {scale}) и готов к скачиванию."
+    st.session_state["dxf_doc"] = doc
+    _export_dxf_doc(doc)
+    extrusion_note = f", экструзия стен {wall_height_mm} мм (псевдо-3D)" if wall_height_mm else ""
+    return (
+        f"DXF файл успешно сгенерирован ({total_entities} объектов, масштаб {scale}{extrusion_note}) "
+        "и готов к скачиванию. Этот чертеж также стал текущим CAD-проектом — можно добавлять "
+        "элементы командами в чате."
+    )
+
+
+def add_wall(x0: float, y0: float, x1: float, y1: float, height_mm: float = 2700) -> str:
+    """Добавляет стену (прямую линию) в текущий CAD-проект в памяти. Координаты x0,y0,x1,y1 в мм.
+    height_mm - высота стены, задает 3D-экструзию (thickness), по умолчанию 2700 мм (стандартный этаж)."""
+    doc = _get_dxf_doc()
+    msp = doc.modelspace()
+    msp.add_line((x0, y0), (x1, y1), dxfattribs={"layer": "WALLS", "thickness": height_mm})
+    _export_dxf_doc(doc)
+    return f"Стена добавлена: ({x0}, {y0}) -> ({x1}, {y1}), высота {height_mm} мм. Всего объектов в проекте: {len(msp)}."
+
+
+def add_room_label(x: float, y: float, text: str, height_mm: float = 250) -> str:
+    """Добавляет текстовую подпись (название или площадь комнаты) в точке x,y (мм) текущего CAD-проекта."""
+    doc = _get_dxf_doc()
+    msp = doc.modelspace()
+    entity = msp.add_text(text, dxfattribs={"layer": "LABELS", "height": height_mm})
+    entity.set_placement((x, y))
+    _export_dxf_doc(doc)
+    return f"Подпись '{text}' добавлена в точке ({x}, {y}). Всего объектов в проекте: {len(msp)}."
+
+
+def remove_last_entity() -> str:
+    """Удаляет последний добавленный объект в текущем CAD-проекте (отмена последнего действия)."""
+    doc = st.session_state.get("dxf_doc")
+    if doc is None:
+        return "CAD-проект пуст."
+    msp = doc.modelspace()
+    entities = list(msp)
+    if not entities:
+        return "CAD-проект пуст."
+    last = entities[-1]
+    dxftype = last.dxftype()
+    msp.delete_entity(last)
+    _export_dxf_doc(doc)
+    return f"Последний объект ({dxftype}) удален. Осталось объектов: {len(msp)}."
+
+
+def list_dxf_entities() -> str:
+    """Показывает сводку по текущему CAD-проекту в памяти: количество объектов по типам и слоям.
+    Используй, чтобы понять текущее состояние чертежа перед тем, как вносить правки."""
+    doc = st.session_state.get("dxf_doc")
+    if doc is None:
+        return "CAD-проект пуст. Сначала сгенерируйте DXF из PDF (generate_dxf_file) или добавьте элементы."
+    msp = doc.modelspace()
+    entities = list(msp)
+    if not entities:
+        return "CAD-проект пуст (0 объектов)."
+
+    types: dict = {}
+    layers: dict = {}
+    for e in entities:
+        types[e.dxftype()] = types.get(e.dxftype(), 0) + 1
+        layer = e.dxf.layer
+        layers[layer] = layers.get(layer, 0) + 1
+
+    return f"Объектов всего: {len(entities)}. По типам: {types}. По слоям: {layers}."
+
+
+def reset_cad_project() -> str:
+    """Полностью очищает текущий CAD-проект в памяти и начинает новый пустой чертеж."""
+    doc = _new_dxf_doc()
+    st.session_state["dxf_doc"] = doc
+    _export_dxf_doc(doc)
+    return "Новый пустой CAD-проект создан."
