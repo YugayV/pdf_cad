@@ -1,9 +1,10 @@
 from langchain.agents import AgentType, initialize_agent
 from langchain.memory import ConversationBufferMemory
 from langchain.tools import StructuredTool
-from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 
 from tools import (
+    CLAUDE_MODEL,
     add_room_label,
     add_wall,
     analyze_pdf_visuals_structured,
@@ -37,7 +38,7 @@ TOOL_FUNCTIONS = [
 def get_agent():
     """Создает нового чат-агента с памятью для диалоговой работы над CAD-проектом:
     подсчет объектов/площадей, расчет сметы, генерация и правка DXF-чертежа через команды в чате."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = ChatAnthropic(model=CLAUDE_MODEL)
     tools = [StructuredTool.from_function(func=fn) for fn in TOOL_FUNCTIONS]
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 

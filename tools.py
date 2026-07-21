@@ -10,9 +10,11 @@ import fitz  # PyMuPDF
 import pandas as pd
 import pdfplumber
 import streamlit as st
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
+
+CLAUDE_MODEL = "claude-opus-4-8"
 
 SUPPORTED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 
@@ -78,7 +80,7 @@ class DrawingAnalysis(BaseModel):
 
 
 def analyze_pdf_visuals_structured(query: str = "", page_number: int = 1) -> str:
-    """Анализирует визуальную часть PDF-чертежа через GPT-4o Vision и возвращает СТРУКТУРИРОВАННЫЙ список объектов
+    """Анализирует визуальную часть PDF-чертежа через Claude Vision и возвращает СТРУКТУРИРОВАННЫЙ список объектов
     (название, количество, единица измерения, габариты). Используй для точного подсчета объектов перед расчетом сметы.
     page_number - номер страницы для анализа, считая с 1 (в многостраничном проекте разные страницы - это разные
     планы/разрезы, их нельзя анализировать все вместе)."""
@@ -104,16 +106,19 @@ def analyze_pdf_visuals_structured(query: str = "", page_number: int = 1) -> str
     message = HumanMessage(
         content=[
             {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": base64_image},
+            },
         ]
     )
 
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        llm = ChatAnthropic(model=CLAUDE_MODEL)
         structured_llm = llm.with_structured_output(DrawingAnalysis)
         result: DrawingAnalysis = structured_llm.invoke([message])
     except Exception as e:
-        return f"Ошибка визуального анализа (проверьте OPENAI_API_KEY): {e}"
+        return f"Ошибка визуального анализа (проверьте ANTHROPIC_API_KEY): {e}"
 
     st.session_state["detected_objects"] = [obj.model_dump() for obj in result.objects]
 
