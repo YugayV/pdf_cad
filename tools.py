@@ -5,10 +5,8 @@ import io
 import pandas as pd
 from PIL import Image
 import streamlit as st
-from langchain_core.tools import tool
 
-@tool
-def extract_text_from_pdf(query: str) -> str:
+def extract_text_from_pdf(query: str = "") -> str:
     """Извлекает весь текст из загруженного PDF чертежа. Используй, если нужно найти размеры, надписи или спецификации."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
@@ -19,8 +17,7 @@ def extract_text_from_pdf(query: str) -> str:
             text += page.extract_text() + "\n"
     return text[:3000] # Ограничиваем для контекста
 
-@tool
-def analyze_pdf_visuals(query: str) -> str:
+def analyze_pdf_visuals(query: str = "") -> str:
     """Анализирует визуальную часть PDF (чертеж) с помощью ИИ. Используй, чтобы найти объекты (шкафы, стены), посчитать их количество или понять геометрию."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
@@ -36,7 +33,6 @@ def analyze_pdf_visuals(query: str) -> str:
     st.session_state["pdf_image_bytes"] = img_bytes
     return "Изображение первой страницы PDF сохранено. Передай его в систему для визуального анализа."
 
-@tool
 def search_excel_price(material_name: str) -> str:
     """Ищет материал или фурнитуру в Excel смете по названию (например, 'ЛДСП', 'Петли', 'Фасад') и возвращает его цену и единицы измерения."""
     df = st.session_state.get("excel_df")
@@ -59,8 +55,7 @@ def search_excel_price(material_name: str) -> str:
         response.append(f"Найдено: {name} | Ед.изм: {unit} | Кол-во: {qty} | Цена: {price}")
     return "; ".join(response)
 
-@tool
-def generate_dxf_file(instructions: str) -> str:
+def generate_dxf_file(instructions: str = "") -> str:
     """Генерирует файл AutoCAD (.dxf) на основе извлеченных из PDF векторных линий и прямоугольников."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
