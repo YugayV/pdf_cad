@@ -566,8 +566,9 @@ def reset_cad_project() -> str:
 
 
 def extract_wall_segments(scale: float = 1.0, page_number: int = 1) -> List[Tuple[float, float, float, float]]:
-    """Извлекает отрезки стен (линии и стороны прямоугольников) с ОДНОЙ страницы PDF в реальных координатах
-    (мм), для 3D-визуализации плана в браузере. Использует ту же логику переноса координат, что и DXF-экспорт."""
+    """Извлекает отрезки СТЕН (длинные линии и вытянутые прямоугольники) с ОДНОЙ страницы PDF в реальных
+    координатах, для 3D-визуализации плана в браузере. Отфильтровывает штриховку, размерные линии, мебель
+    и прочую мелкую графику - в отличие от generate_dxf_file, который сохраняет всё для AutoCAD."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return []
@@ -582,9 +583,22 @@ def extract_wall_segments(scale: float = 1.0, page_number: int = 1) -> List[Tupl
         def to_xy(x, y):
             return (round(x * scale, 2), round((h - y) * scale, 2))
 
+        # На реальных чертежах штриховка и размерные/выносные линии - это множество КОРОТКИХ отрезков
+        # (в детальном чертеже - тысячи линий длиной меньше пиксельного размера штриховки), а мебель и
+        # прочие иконки - небольшие фигуры. Стены и контуры помещений, наоборот, длинные - соизмеримы с
+        # самим планом. Порог длины берём относительно диагонали страницы, чтобы не зависеть от
+        # исходного масштаба PDF. Линию по толщине не фильтруем: многие экспортёры (включая обычный
+        # reportlab) рисуют даже настоящие стены нулевой/минимальной толщиной, поэтому этот признак
+        # ненадёжен и на некоторых чертежах отфильтровал бы все стены.
+        page_diag = (page.width ** 2 + page.height ** 2) ** 0.5
+        min_wall_length = page_diag * 0.015
+
         for line in page.lines:
             if len(segments) >= MAX_DXF_ENTITIES:
                 break
+            length = ((line["x1"] - line["x0"]) ** 2 + (line["y1"] - line["y0"]) ** 2) ** 0.5
+            if length < min_wall_length:
+                continue
             x0, y0 = to_xy(line["x0"], line["y0"])
             x1, y1 = to_xy(line["x1"], line["y1"])
             segments.append((x0, y0, x1, y1))
@@ -592,6 +606,10 @@ def extract_wall_segments(scale: float = 1.0, page_number: int = 1) -> List[Tupl
         for rect in page.rects:
             if len(segments) >= MAX_DXF_ENTITIES:
                 break
+            w = rect["x1"] - rect["x0"]
+            rect_h = rect["bottom"] - rect["top"]
+            if max(w, rect_h) < min_wall_length:
+                continue
             p0 = to_xy(rect["x0"], rect["top"])
             p1 = to_xy(rect["x1"], rect["top"])
             p2 = to_xy(rect["x1"], rect["bottom"])
