@@ -194,6 +194,7 @@ with tab1:
                         st.session_state.get("dxf_scale", 1.0),
                         st.session_state.get("dxf_wall_height", 0),
                         st.session_state.get("page_number", 1),
+                        st.session_state.get("dxf_walls_only", False),
                     )
 
     render_agent_response("💡 Здесь появятся результаты локальной обработки PDF, Excel или DXF.")
@@ -282,6 +283,12 @@ with tab4:
             min_value=0, value=0, step=100, key="dxf_wall_height",
             help="Если больше 0, линии и прямоугольники чертежа получают вертикальную экструзию (псевдо-3D) на эту высоту.",
         )
+    st.checkbox(
+        "Только конструктивные элементы (стены)", key="dxf_walls_only", value=False,
+        help="Исключить из DXF штриховку, размерные линии, мебель и прочую мелкую графику - оставить "
+             "только длинные линии/контуры (стены). По умолчанию выключено — переносится всё как в PDF, "
+             "для максимальной точности при импорте в AutoCAD.",
+    )
     if st.session_state.dxf_data:
         st.success("Файл успешно сгенерирован локально!")
 
