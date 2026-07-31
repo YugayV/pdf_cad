@@ -48,9 +48,27 @@ def get_pdf_page_count() -> int:
         doc.close()
 
 
+# Поля основной надписи (штампа) чертежа - 'Изм.', 'Лист', 'Дата', 'Разраб.' и т.п. Это оформление рамки
+# листа, а не размеры/спецификации самого объекта, и оно засоряет извлеченный текст/названия помещений.
+_TITLEBLOCK_NOISE_RE = re.compile(
+    r"^(изм\.?|кол\.?\s*уч\.?|№\s*докум\.?|подп(ись)?\.?|дата|лист(ов)?|формат|масштаб|"
+    r"инв\.?\s*№.*|взам\.?\s*инв\.?\s*№.*|разраб(отал|\.)?|провер(ил|ка|\.)?|н\.?\s*контр(оль)?\.?|"
+    r"утв(ердил|\.)?|копировал|гип|лит(ера)?\.?)\s*[:.]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_titleblock_noise(text: str) -> str:
+    """Убирает из извлеченного текста строки основной надписи (штампа) чертежа - подписи полей рамки, а
+    не содержательный текст (размеры, спецификации, названия)."""
+    return "\n".join(
+        line for line in text.splitlines() if not _TITLEBLOCK_NOISE_RE.match(line.strip())
+    )
+
+
 def extract_text_from_pdf(query: str = "") -> str:
-    """Извлекает весь текст из загруженного PDF чертежа (по всем страницам). Используй, если нужно найти
-    размеры, надписи или спецификации."""
+    """Извлекает текст из загруженного PDF чертежа (по всем страницам), исключая служебные надписи рамки/
+    штампа (поля 'Изм.', 'Лист', 'Дата' и т.п.). Используй, если нужно найти размеры, надписи или спецификации."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return "PDF не загружен."
@@ -62,6 +80,7 @@ def extract_text_from_pdf(query: str = "") -> str:
         text = "".join(page.get_text() + "\n" for page in doc)
     finally:
         doc.close()
+    text = _strip_titleblock_noise(text)
     return text[:3000]  # Ограничиваем для контекста
 
 
@@ -98,8 +117,12 @@ def analyze_pdf_visuals_structured(query: str = "", page_number: int = 1) -> str
     base64_image = base64.b64encode(img_bytes).decode("utf-8")
 
     prompt_text = (
-        "Ты инженер-чертежник. Внимательно изучи чертеж и посчитай ВСЕ объекты на нем "
-        "(мебель, стены, двери, окна и т.п.), сгруппировав одинаковые элементы. "
+        "Ты инженер-чертежник. Внимательно изучи чертеж и посчитай ВСЕ значимые физические объекты на нем "
+        "(мебель, сантехника, стены, двери, окна, лестницы и т.п.), сгруппировав одинаковые элементы. "
+        "НЕ включай в список: рамку листа и основную надпись (штамп) с полями 'Изм./Кол.уч./Лист/Формат/"
+        "Разработал/Проверил/Дата' и т.п., легенду условных обозначений, размерные и выносные линии, "
+        "маркировку осей и номера помещений, логотипы, печати и штриховку - это оформление чертежа, а не "
+        "объекты на плане. "
         f"Дополнительное указание: {query or 'выполни общий подсчет всех объектов'}. "
         "Для каждого типа объекта укажи точное количество и габариты (мм), если они подписаны на чертеже."
     )
@@ -256,6 +279,13 @@ ROOM_LIST_LINE = re.compile(r"^(\d{1,3})\.\s*(.+?)\s*[-–—]\s*(\d+[.,]?\d*)\s
 AREA_TOKEN = re.compile(r"(\d+[.,]?\d*)\s*(?:м2|м²|m2)", re.IGNORECASE)
 
 
+def _is_noise_room_name(name: str) -> bool:
+    """Отсеивает подписи полей штампа (см. _TITLEBLOCK_NOISE_RE) и слишком короткие/пустые обрывки текста,
+    которые иногда случайно совпадают по формату с записью экспликации ('N. Текст - число')."""
+    stripped = name.strip()
+    return len(stripped) < 2 or bool(_TITLEBLOCK_NOISE_RE.match(stripped))
+
+
 def _parse_room_list_text(text: str) -> Tuple[List["RoomEntry"], Optional[float]]:
     """Резервный разбор экспликации, оформленной обычным нумерованным списком в тексте чертежа
     (например '1. ТАМБУР - 8,6' ... 'ИТОГО: S ПОЛЕЗНАЯ - 150,0 М2'), а не бордюрной таблицей."""
@@ -268,11 +298,14 @@ def _parse_room_list_text(text: str) -> Tuple[List["RoomEntry"], Optional[float]
         match = ROOM_LIST_LINE.match(line)
         if match:
             number, name, area_raw = match.groups()
+            name = name.strip()
+            if _is_noise_room_name(name):
+                continue
             try:
                 area = float(area_raw.replace(",", "."))
             except ValueError:
                 continue
-            rooms.append(RoomEntry(number=number, name=name.strip(), area_m2=area))
+            rooms.append(RoomEntry(number=number, name=name, area_m2=area))
             continue
         if "итого" in line.lower():
             # Берем ПОСЛЕДНЕЕ число вида "N м2" в строке - само слово "итого" и текст перед числом
@@ -321,6 +354,8 @@ def extract_room_schedule() -> str:
                     area_raw = str(data_row[area_idx] or "").strip().replace(",", ".")
                     number = str(data_row[num_idx] or "").strip()
                     if not name and not area_raw:
+                        continue
+                    if name and _is_noise_room_name(name):
                         continue
                     try:
                         area = float(area_raw)
@@ -426,7 +461,16 @@ def _export_dxf_doc(doc) -> bytes:
 MAX_DXF_ENTITIES = 200_000  # защита от многочасовой генерации/неоткрываемых файлов на сверхдетальных чертежах
 
 
-def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number: int = 1) -> str:
+def _min_structural_length(page) -> float:
+    """Порог длины (в единицах PDF) для отсева штриховки, размерных линий и мелкой графики (мебель,
+    иконки) при выделении конструктивных элементов (стен). Берется относительно диагонали страницы,
+    чтобы не зависеть от исходного масштаба PDF - см. пояснение в extract_wall_segments."""
+    return (page.width ** 2 + page.height ** 2) ** 0.5 * 0.015
+
+
+def generate_dxf_file(
+    scale: float = 1.0, wall_height_mm: float = 0, page_number: int = 1, walls_only: bool = False,
+) -> str:
     """Генерирует файл AutoCAD (.dxf) на основе извлеченных из PDF векторных линий, прямоугольников и кривых
     ОДНОЙ страницы. Начинает новый CAD-проект в памяти, к которому потом можно добавлять элементы через чат
     (add_wall и т.п.). scale - коэффициент масштабирования (мм на единицу PDF), позволяет привести чертеж к
@@ -434,7 +478,10 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number
     (thickness) на эту высоту в мм — при открытии в AutoCAD они отображаются как 3D-стены (псевдо-3D).
     page_number - номер страницы для конвертации, считая с 1 (в многостраничном проекте страницы обычно
     содержат разные, несовместимые по масштабу и содержанию виды - план, разрезы, фасады - поэтому
-    конвертируется только одна выбранная страница, а не все сразу)."""
+    конвертируется только одна выбранная страница, а не все сразу). walls_only - если True, переносятся
+    только длинные линии/прямоугольники (стены и контуры помещений), а штриховка, размерные линии, мебель
+    и прочая мелкая графика исключаются — чертеж получается чище, но менее полным; по умолчанию False
+    (переносится всё, как есть в PDF, для максимальной точности при импорте в AutoCAD)."""
     pdf_bytes = st.session_state.get("pdf_bytes")
     if not pdf_bytes:
         return "PDF не загружен, невозможно создать DXF."
@@ -450,6 +497,7 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number
             return f"Неверный номер страницы: {page_number}. В документе {len(pdf.pages)} стр."
         page = pdf.pages[page_number - 1]
         h = page.height
+        min_length = _min_structural_length(page) if walls_only else 0.0
 
         def to_dxf(x, y):
             return (round(x * scale, 3), round((h - y) * scale, 3))
@@ -458,6 +506,10 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number
             if total_entities >= MAX_DXF_ENTITIES:
                 truncated = True
                 break
+            if walls_only:
+                length = ((line["x1"] - line["x0"]) ** 2 + (line["y1"] - line["y0"]) ** 2) ** 0.5
+                if length < min_length:
+                    continue
             start = to_dxf(line["x0"], line["y0"])
             end = to_dxf(line["x1"], line["y1"])
             msp.add_line(start, end, dxfattribs={"layer": "LINES", **wall_attribs})
@@ -468,26 +520,33 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number
                 truncated = True
                 break
             x0, y0, x1, y1 = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
+            if walls_only and max(x1 - x0, y1 - y0) < min_length:
+                continue
             points = [to_dxf(x0, y0), to_dxf(x1, y0), to_dxf(x1, y1), to_dxf(x0, y1)]
             msp.add_lwpolyline(points, close=True, dxfattribs={"layer": "RECTS", **wall_attribs})
             total_entities += 1
 
-        for curve in page.curves:
-            if total_entities >= MAX_DXF_ENTITIES:
-                truncated = True
-                break
-            pts = curve.get("pts") or []
-            if len(pts) >= 2:
-                points = [to_dxf(px, py) for px, py in pts]
-                msp.add_lwpolyline(points, dxfattribs={"layer": "CURVES"})
-                total_entities += 1
+        if not walls_only:
+            # Кривые - это почти всегда мебель, сантехника, дверные врезки и другие декоративные
+            # элементы, а не конструктив, поэтому при walls_only их не переносим вовсе.
+            for curve in page.curves:
+                if total_entities >= MAX_DXF_ENTITIES:
+                    truncated = True
+                    break
+                pts = curve.get("pts") or []
+                if len(pts) >= 2:
+                    points = [to_dxf(px, py) for px, py in pts]
+                    msp.add_lwpolyline(points, dxfattribs={"layer": "CURVES"})
+                    total_entities += 1
 
     if total_entities == 0:
-        return f"На странице {page_number} не найдено векторных линий/фигур для конвертации в DXF."
+        note = " (при фильтре 'только стены' конструктивные элементы не найдены)" if walls_only else ""
+        return f"На странице {page_number} не найдено векторных линий/фигур для конвертации в DXF{note}."
 
     st.session_state["dxf_doc"] = doc
     _export_dxf_doc(doc)
     extrusion_note = f", экструзия стен {wall_height_mm} мм (псевдо-3D)" if wall_height_mm else ""
+    filter_note = ", только конструктивные элементы (стены)" if walls_only else ""
     truncation_note = (
         f" Внимание: чертеж очень детальный, перенесены первые {MAX_DXF_ENTITIES} объектов из большего числа."
         if truncated
@@ -495,8 +554,8 @@ def generate_dxf_file(scale: float = 1.0, wall_height_mm: float = 0, page_number
     )
     return (
         f"DXF файл успешно сгенерирован (стр. {page_number}, {total_entities} объектов, масштаб {scale}"
-        f"{extrusion_note}) и готов к скачиванию. Этот чертеж также стал текущим CAD-проектом — можно "
-        f"добавлять элементы командами в чате.{truncation_note}"
+        f"{extrusion_note}{filter_note}) и готов к скачиванию. Этот чертеж также стал текущим CAD-проектом — "
+        f"можно добавлять элементы командами в чате.{truncation_note}"
     )
 
 
@@ -586,12 +645,11 @@ def extract_wall_segments(scale: float = 1.0, page_number: int = 1) -> List[Tupl
         # На реальных чертежах штриховка и размерные/выносные линии - это множество КОРОТКИХ отрезков
         # (в детальном чертеже - тысячи линий длиной меньше пиксельного размера штриховки), а мебель и
         # прочие иконки - небольшие фигуры. Стены и контуры помещений, наоборот, длинные - соизмеримы с
-        # самим планом. Порог длины берём относительно диагонали страницы, чтобы не зависеть от
-        # исходного масштаба PDF. Линию по толщине не фильтруем: многие экспортёры (включая обычный
-        # reportlab) рисуют даже настоящие стены нулевой/минимальной толщиной, поэтому этот признак
-        # ненадёжен и на некоторых чертежах отфильтровал бы все стены.
-        page_diag = (page.width ** 2 + page.height ** 2) ** 0.5
-        min_wall_length = page_diag * 0.015
+        # самим планом. Линию по толщине не фильтруем: многие экспортёры (включая обычный reportlab)
+        # рисуют даже настоящие стены нулевой/минимальной толщиной, поэтому этот признак ненадёжен и на
+        # некоторых чертежах отфильтровал бы все стены. Тот же порог используется в generate_dxf_file
+        # (walls_only=True) - см. _min_structural_length.
+        min_wall_length = _min_structural_length(page)
 
         for line in page.lines:
             if len(segments) >= MAX_DXF_ENTITIES:
